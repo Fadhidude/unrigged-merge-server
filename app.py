@@ -9,50 +9,32 @@ AUDIO_BUCKET = 'unrigged-audio'
 VIDEO_BUCKET = 'unrigged-video'
 
 def sb_update_job(job_id, data):
-    """Skriv jobbstatus till Supabase."""
     try:
         requests.patch(
             f"{SUPABASE_URL}/rest/v1/video_jobs?job_id=eq.{job_id}",
-            headers={
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'apikey': SUPABASE_KEY,
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal'
-            },
-            json=data,
-            timeout=10
-        )
+            headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY,
+                     'Content-Type': 'application/json', 'Prefer': 'return=minimal'},
+            json=data, timeout=10)
     except Exception as e:
         print(f"Supabase update error: {e}")
 
 def sb_create_job(job_id):
-    """Skapa nytt jobb i Supabase."""
     try:
         requests.post(
             f"{SUPABASE_URL}/rest/v1/video_jobs",
-            headers={
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'apikey': SUPABASE_KEY,
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal'
-            },
+            headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY,
+                     'Content-Type': 'application/json', 'Prefer': 'return=minimal'},
             json={'job_id': job_id, 'status': 'processing', 'progress': 'Startar...'},
-            timeout=10
-        )
+            timeout=10)
     except Exception as e:
         print(f"Supabase create error: {e}")
 
 def sb_get_job(job_id):
-    """Hämta jobbstatus från Supabase."""
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/video_jobs?job_id=eq.{job_id}&select=*",
-            headers={
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'apikey': SUPABASE_KEY
-            },
-            timeout=10
-        )
+            headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY},
+            timeout=10)
         data = r.json()
         return data[0] if data else None
     except:
@@ -85,9 +67,30 @@ def parse_body():
     except:
         return None
 
+def get_audio_duration(path):
+    """Get duration of audio file in seconds."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', path],
+        capture_output=True, text=True)
+    try:
+        return float(json.loads(result.stdout)['format']['duration'])
+    except:
+        return 0
+
+def download_file(url, path, timeout=30):
+    """Download file from URL to local path."""
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            open(path, 'wb').write(r.content)
+            return True
+    except:
+        pass
+    return False
+
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'service': 'Unrigged Merge v12 (supabase jobs)'})
+    return jsonify({'status': 'ok', 'service': 'Unrigged Merge v13 (advanced-mix)'})
 
 @app.route('/job-status/<job_id>')
 def job_status(job_id):
@@ -96,7 +99,7 @@ def job_status(job_id):
         return jsonify({'status': 'not_found'}), 404
     return jsonify(job)
 
-# ── AUDIO MERGE ───────────────────────────────────────────────────────────────
+# ── BASIC AUDIO MERGE (kept for compatibility) ────────────────────────────
 @app.route('/merge-from-drive', methods=['POST'])
 def merge_from_drive():
     from googleapiclient.http import MediaIoBaseDownload
@@ -159,7 +162,193 @@ def merge_from_drive():
             'size_mb': size_mb, 'chunks_merged': len(paths), 'background_mixed': has_bg
         })
 
-# ── VIDEO WORKER ──────────────────────────────────────────────────────────────
+# ── ADVANCED MULTI-TRACK MIX ─────────────────────────────────────────────
+@app.route('/advanced-mix', methods=['POST'])
+def advanced_mix():
+    """
+    Multi-track audio mixing:
+    - Layer 1: Voice (full duration, always on top)
+    - Layer 2: Base music (full duration, low volume)
+    - Layer 3: Segments (emotion-based, timed)
+    - Layer 4: Stings (punctual hits)
+    """
+    data = parse_body()
+    if not data:
+        return jsonify({'error': 'Invalid JSON'}), 400
+
+    voice_url   = data.get('voice_url', '')
+    base_url    = data.get('base_url', '')
+    base_volume = data.get('base_volume', 0.08)
+    segments    = data.get('segments', [])
+    stings      = data.get('stings', [])
+
+    if not voice_url:
+        return jsonify({'error': 'No voice_url provided'}), 400
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # ── Download voice ────────────────────────────────────────────────
+        voice_path = os.path.join(tmp, 'voice.mp3')
+        if not download_file(voice_url, voice_path, timeout=60):
+            return jsonify({'error': 'Failed to download voice'}), 500
+
+        voice_dur = get_audio_duration(voice_path)
+        if voice_dur <= 0:
+            return jsonify({'error': 'Invalid voice duration'}), 500
+
+        print(f"Voice duration: {voice_dur:.1f}s")
+
+        # ── Download base music ───────────────────────────────────────────
+        base_path = os.path.join(tmp, 'base.mp3')
+        has_base = download_file(base_url, base_path, timeout=30) if base_url else False
+
+        # ── Download segments ─────────────────────────────────────────────
+        seg_paths = []
+        for i, seg in enumerate(segments):
+            seg_path = os.path.join(tmp, f'seg_{i}.mp3')
+            if download_file(seg.get('url', ''), seg_path, timeout=30):
+                seg_paths.append((i, seg, seg_path))
+                print(f"Segment {i} downloaded: {seg.get('emotion')}")
+
+        # ── Download stings ───────────────────────────────────────────────
+        sting_paths = []
+        for i, sting in enumerate(stings):
+            sting_path = os.path.join(tmp, f'sting_{i}.mp3')
+            if download_file(sting.get('url', ''), sting_path, timeout=15):
+                sting_paths.append((i, sting, sting_path))
+
+        # ── Build ffmpeg filter_complex ───────────────────────────────────
+        # Strategy: mix everything with amix, apply volume and timing
+        
+        inputs = ['-i', voice_path]
+        filter_parts = []
+        mix_inputs = ['[0:a]']  # voice always first
+        
+        input_idx = 1
+
+        # Base music: loop it to match voice duration
+        if has_base:
+            base_looped = os.path.join(tmp, 'base_looped.mp3')
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-stream_loop', '-1',
+                '-i', base_path,
+                '-t', str(voice_dur),
+                '-c', 'copy',
+                base_looped
+            ], capture_output=True, timeout=60)
+
+            if os.path.exists(base_looped) and os.path.getsize(base_looped) > 0:
+                inputs += ['-i', base_looped]
+                filter_parts.append(f'[{input_idx}:a]volume={base_volume}[base]')
+                mix_inputs.append('[base]')
+                input_idx += 1
+
+        # Segments: delay each to correct position based on word proportion
+        words_total = max(s.get('end_word', 1) for s in segments) if segments else 1
+        
+        for i, seg, seg_path in seg_paths:
+            seg_dur = get_audio_duration(seg_path)
+            if seg_dur <= 0:
+                continue
+
+            # Calculate start time based on word position
+            start_word = seg.get('start_word', 0)
+            start_sec = (start_word / max(words_total, 1)) * voice_dur
+            start_sec = min(start_sec, voice_dur - 5)  # safety
+
+            fade_in  = seg.get('fade_in', 2)
+            fade_out = seg.get('fade_out', 3)
+            vol      = seg.get('volume', 0.15)
+
+            # Trim segment to not exceed voice
+            available = voice_dur - start_sec
+            use_dur   = min(seg_dur, available)
+
+            label = f'seg{i}'
+            filter_parts.append(
+                f'[{input_idx}:a]'
+                f'volume={vol},'
+                f'afade=t=in:st=0:d={fade_in},'
+                f'afade=t=out:st={max(use_dur-fade_out,0):.1f}:d={fade_out},'
+                f'adelay={int(start_sec*1000)}|{int(start_sec*1000)},'
+                f'apad=whole_dur={voice_dur}'
+                f'[{label}]'
+            )
+            mix_inputs.append(f'[{label}]')
+            inputs += ['-i', seg_path]
+            input_idx += 1
+
+        # Stings: positioned at specific moments
+        for i, sting, sting_path in sting_paths:
+            sting_dur = get_audio_duration(sting_path)
+            if sting_dur <= 0:
+                continue
+
+            # Position stings at 30% and 60% of voice by default
+            sting_positions = [0.30, 0.60, 0.80]
+            start_sec = sting_positions[i % len(sting_positions)] * voice_dur
+            vol = sting.get('volume', 0.35)
+
+            label = f'sting{i}'
+            filter_parts.append(
+                f'[{input_idx}:a]'
+                f'volume={vol},'
+                f'adelay={int(start_sec*1000)}|{int(start_sec*1000)},'
+                f'apad=whole_dur={voice_dur}'
+                f'[{label}]'
+            )
+            mix_inputs.append(f'[{label}]')
+            inputs += ['-i', sting_path]
+            input_idx += 1
+
+        # ── Final mix ─────────────────────────────────────────────────────
+        n_inputs = len(mix_inputs)
+        
+        if n_inputs == 1:
+            # Only voice — no music downloaded
+            filter_complex = '[0:a]volume=1.0[out]'
+        else:
+            mix_str = ''.join(mix_inputs)
+            filter_parts.append(
+                f'{mix_str}amix=inputs={n_inputs}:duration=first:dropout_transition=2,'
+                f'dynaudnorm=f=150:g=15[out]'
+            )
+            filter_complex = ';'.join(filter_parts)
+
+        merged = os.path.join(tmp, 'unrigged_mixed.mp3')
+        
+        cmd = ['ffmpeg', '-y'] + inputs + [
+            '-filter_complex', filter_complex,
+            '-map', '[out]',
+            '-c:a', 'libmp3lame',
+            '-q:a', '2',
+            '-t', str(voice_dur),
+            merged
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+
+        if not os.path.exists(merged) or os.path.getsize(merged) == 0:
+            print("ffmpeg stderr:", result.stderr.decode()[:500])
+            # Fallback: just use voice
+            import shutil
+            shutil.copy(voice_path, merged)
+
+        size_mb = round(os.path.getsize(merged) / 1024 / 1024, 2)
+        supabase_upload(merged, AUDIO_BUCKET, 'unrigged_final.mp3', 'audio/mpeg')
+
+        return jsonify({
+            'ok': True,
+            'url': f"{SUPABASE_URL}/storage/v1/object/public/{AUDIO_BUCKET}/unrigged_final.mp3",
+            'size_mb': size_mb,
+            'voice_duration_sec': round(voice_dur),
+            'tracks_mixed': n_inputs,
+            'segments_used': len(seg_paths),
+            'stings_used': len(sting_paths),
+            'base_mixed': has_base
+        })
+
+# ── VIDEO WORKER ──────────────────────────────────────────────────────────
 def _assemble_worker(job_id, data):
     try:
         if not data or not isinstance(data, dict):
